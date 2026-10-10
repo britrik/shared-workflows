@@ -28,6 +28,8 @@ permissions:
 jobs:
   gitleaks:
     name: Secret scan
+    # A branch-deletion push has nothing to scan (and nothing to check out).
+    if: github.event_name != 'push' || github.event.after != '0000000000000000000000000000000000000000'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -66,6 +68,10 @@ jobs:
             pull_request|pull_request_target)
               opts="${PR_BASE}..${PR_HEAD}" ;;
             push)
+              if [ -z "$PUSH_AFTER" ] || [ "$PUSH_AFTER" = "$zero" ]; then
+                echo "Branch deletion: nothing to scan."
+                echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+              fi
               if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "$zero" ] \
                  && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
                 opts="${PUSH_BEFORE}..${PUSH_AFTER}"
@@ -91,7 +97,7 @@ jobs:
         # .gitleaks.toml and .gitleaksignore from the base commit. Changes to
         # either file take effect once merged. Only the runner's scratch copy of
         # the working tree is touched; history is read from git.
-        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+        if: steps.range.outputs.skip != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -113,6 +119,7 @@ jobs:
           fi
 
       - name: Run gitleaks
+        if: steps.range.outputs.skip != 'true'
         env:
           LOG_OPTS: ${{ steps.range.outputs.log_opts }}
           EVENT: ${{ github.event_name }}
