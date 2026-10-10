@@ -39,4 +39,6 @@ jobs:
 
 A `.gitleaks.toml` at the repo root is picked up automatically (extend the default rules there). To accept a confirmed false positive, add its fingerprint to `.gitleaksignore`. If a real secret is found, rotate it first.
 
+Pull-request scans use the base branch's `.gitleaks.toml` and `.gitleaksignore` and ignore inline `gitleaks:allow` comments, so a PR can't silence its own findings. Changes to either file take effect once merged.
+
 Inputs: `gitleaks-version` and `gitleaks-sha256` (the linux_x64 tarball checksum) to move to another release.
