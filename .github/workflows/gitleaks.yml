@@ -1,0 +1,103 @@
+# Reusable Gitleaks secret scan for britrik repos (oss-radar #9).
+# Callers: jobs.<id>.uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
+#
+# - pull_request: scans only the PR's commits (base..head)
+# - push:         scans only the pushed commits (before..after); full history on a new branch
+# - schedule / workflow_dispatch: scans the full history
+# Findings are always redacted; secret values never reach logs or the job summary.
+name: Gitleaks (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gitleaks-version:
+        description: Gitleaks release to install (without the leading v)
+        type: string
+        default: "8.30.1"
+      gitleaks-sha256:
+        description: SHA-256 of gitleaks_<version>_linux_x64.tar.gz (must match gitleaks-version)
+        type: string
+        default: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        env:
+          GL_VERSION: ${{ inputs.gitleaks-version }}
+          GL_SHA256: ${{ inputs.gitleaks-sha256 }}
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/${tarball}"
+          echo "${GL_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Work out the commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          opts=""
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              opts="${PR_BASE}..${PR_HEAD}" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "$zero" ] \
+                 && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                opts="${PUSH_BEFORE}..${PUSH_AFTER}"
+              fi ;;
+          esac
+          # Validate: only commit SHAs and '..' may reach the command line.
+          if [ -n "$opts" ] && ! [[ "$opts" =~ ^[0-9a-f]{40}\.\.[0-9a-f]{40}$ ]]; then
+            echo "Unexpected commit range; falling back to full history."; opts=""
+          fi
+          echo "log_opts=$opts" >> "$GITHUB_OUTPUT"
+          echo "Scan range: ${opts:-full history}"
+
+      - name: Run gitleaks
+        env:
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+        run: |
+          set -uo pipefail
+          args=(git . --redact=100 --no-banner --exit-code 1
+                --report-format json --report-path "$RUNNER_TEMP/gitleaks.json")
+          [ -n "$LOG_OPTS" ] && args+=(--log-opts "$LOG_OPTS")
+          # .gitleaks.toml and .gitleaksignore at the repo root are picked up automatically.
+          "$RUNNER_TEMP/gitleaks" "${args[@]}"
+          rc=$?
+          if [ -s "$RUNNER_TEMP/gitleaks.json" ]; then
+            n=$(jq length "$RUNNER_TEMP/gitleaks.json")
+            {
+              echo "### Gitleaks: $n finding(s)"
+              if [ "$n" -gt 0 ]; then
+                echo
+                echo "| Rule | File | Line | Commit | Fingerprint |"
+                echo "|---|---|---|---|---|"
+                jq -r '.[] | "| \(.RuleID) | `\(.File)` | \(.StartLine) | \(.Commit[0:8]) | `\(.Fingerprint)` |"' "$RUNNER_TEMP/gitleaks.json"
+                echo
+                echo "Rotate any real secret first. Confirmed false positives: add the fingerprint to \`.gitleaksignore\`."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
