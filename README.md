@@ -30,8 +30,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: gitleaks-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: gitleaks-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   gitleaks:
     uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
