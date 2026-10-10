@@ -1,0 +1,151 @@
+# Reusable Gitleaks secret scan for britrik repos (oss-radar #9).
+# Callers: jobs.<id>.uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
+#
+# - pull_request: scans only the PR's commits (base..head)
+# - push:         scans only the pushed commits (before..after); full history on a new branch
+# - schedule / workflow_dispatch: scans the full history
+# - merge commits: the conflict-resolution part of each merge is scanned too
+# - PRs use the base branch's .gitleaks.toml/.gitleaksignore and ignore inline
+#   gitleaks:allow, so a PR can't suppress its own findings
+# Findings are always redacted; secret values never reach logs or the job summary.
+name: Gitleaks (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gitleaks-version:
+        description: Gitleaks release to install (without the leading v)
+        type: string
+        default: "8.30.1"
+      gitleaks-sha256:
+        description: SHA-256 of gitleaks_<version>_linux_x64.tar.gz (must match gitleaks-version)
+        type: string
+        default: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan
+    # A branch-deletion push has nothing to scan (and nothing to check out).
+    if: github.event_name != 'push' || github.event.after != '0000000000000000000000000000000000000000'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        env:
+          GL_VERSION: ${{ inputs.gitleaks-version }}
+          GL_SHA256: ${{ inputs.gitleaks-sha256 }}
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/${tarball}"
+          echo "${GL_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Work out the commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          opts=""
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              opts="${PR_BASE}..${PR_HEAD}" ;;
+            push)
+              if [ -z "$PUSH_AFTER" ] || [ "$PUSH_AFTER" = "$zero" ]; then
+                echo "Branch deletion: nothing to scan."
+                echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "$zero" ] \
+                 && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                opts="${PUSH_BEFORE}..${PUSH_AFTER}"
+              fi ;;
+          esac
+          # Validate: only commit SHAs and '..' may reach the command line.
+          if [ -n "$opts" ] && ! [[ "$opts" =~ ^[0-9a-f]{40}\.\.[0-9a-f]{40}$ ]]; then
+            echo "Unexpected commit range; falling back to full history."; opts=""
+          fi
+          echo "Scan range: ${opts:-full history}"
+          # Merge commits have no patch in `git log -p` unless asked; remerge shows
+          # only what a merge resolution added, so secrets typed into a conflict fix
+          # are caught without rescanning the merged branch (needs git >= 2.36).
+          if [ -n "$opts" ]; then
+            opts="--diff-merges=remerge $opts"
+          else
+            opts="--full-history --all --diff-merges=remerge"
+          fi
+          echo "log_opts=$opts" >> "$GITHUB_OUTPUT"
+
+      - name: Use the base branch's scan config (pull requests)
+        # A PR must not be able to silence its own findings, so PR scans read
+        # .gitleaks.toml and .gitleaksignore from the base commit. Changes to
+        # either file take effect once merged. Only the runner's scratch copy of
+        # the working tree is touched; history is read from git.
+        if: steps.range.outputs.skip != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "Unexpected base SHA"; exit 1; }
+          for f in .gitleaks.toml .gitleaksignore; do
+            if git cat-file -e "${PR_BASE}:${f}" 2>/dev/null; then
+              git show "${PR_BASE}:${f}" > "$f"
+            else
+              rm -f "$f"
+            fi
+          done
+          changed=$(git diff --name-only "${PR_BASE}...${PR_HEAD}" -- .gitleaks.toml .gitleaksignore || true)
+          if [ -n "$changed" ]; then
+            msg="This PR changes $(echo $changed | tr ' ' ','); this scan uses the base branch's version. The change applies after merge."
+            echo "::notice::$msg"
+            { echo "> $msg"; echo; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run gitleaks
+        if: steps.range.outputs.skip != 'true'
+        env:
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          args=(git . --redact=100 --no-banner --exit-code 1
+                --report-format json --report-path "$RUNNER_TEMP/gitleaks.json")
+          args+=(--log-opts "$LOG_OPTS")
+          # Inline gitleaks:allow comments are ignored on PRs for the same reason.
+          case "$EVENT" in pull_request|pull_request_target) args+=(--ignore-gitleaks-allow) ;; esac
+          # .gitleaks.toml and .gitleaksignore at the repo root are picked up automatically
+          # (for PRs, the base branch's copies placed by the previous step).
+          "$RUNNER_TEMP/gitleaks" "${args[@]}"
+          rc=$?
+          if [ -s "$RUNNER_TEMP/gitleaks.json" ]; then
+            n=$(jq length "$RUNNER_TEMP/gitleaks.json")
+            {
+              echo "### Gitleaks: $n finding(s)"
+              if [ "$n" -gt 0 ]; then
+                echo
+                echo "| Rule | File | Line | Commit | Fingerprint |"
+                echo "|---|---|---|---|---|"
+                jq -r '.[] | "| \(.RuleID) | `\(.File)` | \(.StartLine) | \(.Commit[0:8]) | `\(.Fingerprint)` |"' "$RUNNER_TEMP/gitleaks.json"
+                echo
+                echo "Rotate any real secret first. Confirmed false positives: add the fingerprint to \`.gitleaksignore\`."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
