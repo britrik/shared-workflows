@@ -12,6 +12,8 @@ Reusable GitHub Actions workflows for britrik repos.
 | `push` | the pushed commits (before..after); full history on a new branch |
 | `schedule`, `workflow_dispatch` | the full history |
 
+Merge commits are scanned with `--diff-merges=remerge`, so a secret added while resolving a conflict is caught.
+
 Findings are redacted; the job summary lists rule, file, line, commit and fingerprint only. The job fails when anything is found.
 
 Call it from a repo's `.github/workflows/gitleaks.yml`:
@@ -27,6 +29,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: gitleaks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   gitleaks:
     uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
