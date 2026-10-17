@@ -34,6 +34,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   gitleaks:
+    # Use @main for automatic rule/version updates, or pin to @v1 / @v1.0.0 (or a commit SHA) for strict immutability:
     uses: britrik/shared-workflows/.github/workflows/gitleaks.yml@main
 ```
 
